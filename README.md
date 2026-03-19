@@ -84,6 +84,7 @@ Validation always runs on the full `fineweb_val_*` split, which is the fixed fir
 Once you're happy with your local tests, or you want more compute, switch to a remote CUDA machine.
 
 You can rent GPUs from anywhere, but OpenAI is partnering with Runpod to make setup as easy as possible.  
+For a repeatable checked-in workflow that starts with cheap smoke tests, see [RUNPOD.md](RUNPOD.md).
 
 #### Launching a 1xH100 Pod
 
