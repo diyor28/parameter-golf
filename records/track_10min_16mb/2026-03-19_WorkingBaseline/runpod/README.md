@@ -1,17 +1,17 @@
 # Runpod Workflow
 
-This workflow is now centered around one happy path:
+This workflow is now centered around one Python entrypoint:
 
 ```bash
 cd /Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod
 just run
 ```
 
-That command now does all of the following under the hood:
+`just` now calls [launcher.py](/Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/launcher.py), which does all of the following under the hood:
 - reuses a matching running pod if one already exists
 - otherwise creates a fresh pod
 - waits for real SSH readiness
-- syncs the local repo snapshot via `rsync`
+- syncs only the required local snapshot via `rsync`
 - runs remote bootstrap only if the pod is not already bootstrapped
 - launches training
 - stops the pod automatically when the run finishes
@@ -64,7 +64,7 @@ The default naming scheme includes:
 Example generated name:
 
 ```text
-experiment_2x5090_sp1024_l9d512h8kv4-relu2_tbt131072-ga1_0320T110500Z
+experiment_2x5090_sp1024_l9d512h8kv4-relu2_tbt65536_0320T110500Z
 ```
 
 ## Diagnostics
@@ -81,7 +81,6 @@ just summarize
 
 `just status` shows:
 - the current pod id, name, status, and SSH endpoint
-- the remote branch
 - the latest run dir
 - active training processes
 - the latest train log tail
@@ -91,12 +90,13 @@ just summarize
 
 - `rsync` is the default sync path. We no longer rely on `scp -r` as the normal workflow.
 - `rsync` runs with `--no-owner --no-group` to avoid the permission noise we hit on Runpod volumes.
-- The local repo is the source of truth. We do not manage a mutable remote git checkout anymore.
-- We sync the repo snapshot, excluding bulky local-only paths like datasets, logs, and `.venv-runpod`.
+- The local repo is the source of truth. We do not manage a mutable remote git checkout.
+- We sync only the paths the run actually needs: `data/` and the working record folder.
 - We only reuse already-running pods by default. Stopped pods are not resumed automatically.
 - The pod configs still default to the official Runpod PyTorch 2.8.0 template `runpod-torch-v280`.
 - The experiment pod uses `2x NVIDIA GeForce RTX 5090` on `SECURE` cloud only.
 - New launches fail fast if secure capacity is unavailable.
+- There is now a first-class path to a prebuilt custom image via `RUNPOD_IMAGE`, which avoids repeated `pip install` on fresh pods.
 
 ## Current experiment defaults
 
@@ -105,6 +105,7 @@ just summarize
 - `TRAIN_BATCH_TOKENS=65536`
 - `VAL_BATCH_SIZE=65536`
 - `MUON_BACKEND_STEPS=5`
+- `SKIP_PIP_INSTALL=0`
 
 Additional supported tuning knobs:
 - `TRAIN_BATCH_TOKENS=...`
@@ -118,6 +119,25 @@ W&B auth is read from:
 `records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/secrets.env`
 
 That file is local-only and gitignored.
+
+## Prebuilt image
+
+The long-term fast path is a custom Runpod image that already has the Python
+dependencies installed.
+
+Files:
+- [image/Dockerfile](/Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/image/Dockerfile)
+- [image/requirements.txt](/Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/image/requirements.txt)
+- [image/README.md](/Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/image/README.md)
+
+Once that image is published, set:
+
+```bash
+RUNPOD_IMAGE=<your-image>
+SKIP_PIP_INSTALL=1
+```
+
+That removes the slowest first-run setup step on new pods.
 
 ## Local analysis
 

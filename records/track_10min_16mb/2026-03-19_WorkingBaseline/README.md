@@ -2,12 +2,12 @@ This folder is a working copy of the baseline trainer for iterative baseline-foc
 
 Contents:
 - `train_gpt.py`: copied from the baseline record and intended to be edited here
-- `runpod/`: local pod management scripts plus remote training payloads for this record
+- `runpod/`: Python launcher, remote training payloads, and configs for this record
 
 Recommended flow:
 1. Edit `train_gpt.py` in this folder.
-2. Prepare a fresh dual-5090 pod with `runpod/pod_prepare.sh`.
-3. Launch a run with `runpod/pod_run.sh` or `runpod/justfile`.
-4. Check progress with `runpod/pod_status.sh`.
+2. `cd runpod`
+3. Launch a run with `just run`.
+4. Check progress with `just status`.
 
 See `runpod/README.md` for the exact commands.

@@ -23,8 +23,9 @@ That means:
 
 We already chose:
 - Runpod as the remote GPU provider
-- the official PyTorch 2.8.0 Runpod template
+- the official PyTorch 2.8.0 Runpod template as the fallback base
 - Weights & Biases for experiment monitoring
+- a Python-based launcher/orchestrator as the canonical local control plane
 
 ## Workflow decisions
 
@@ -33,7 +34,8 @@ The only Runpod workflow we care about is the record-local one under:
 `records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod`
 
 Important conventions:
-- prefer the new `pod_*` local scripts and `remote_*` remote scripts
+- prefer the Python launcher at `records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/launcher.py`
+- the older `pod_*` local scripts and `remote_*` remote scripts should be treated as implementation details or migration leftovers, not the preferred interface
 - breaking workflow changes are acceptable; there is no team compatibility requirement
 - do not preserve obsolete compatibility wrappers just to avoid churn
 - prefer a single obvious happy path over multiple overlapping ways to do the same thing
@@ -52,10 +54,14 @@ The intended commands are now:
 The launcher should do the whole experiment setup under the hood:
 - reuse a running matching pod when possible
 - create a new pod when no running match exists
-- sync the repo snapshot from local via `rsync`
+- sync only the required local snapshot from local via `rsync`
 - run bootstrap only when the pod is not already bootstrapped
 - start training
 - stop the pod automatically at the end
+
+Long-term speed direction:
+- move toward a custom Runpod image with the Python dependencies preinstalled
+- when a custom image is available, prefer `RUNPOD_IMAGE` + `SKIP_PIP_INSTALL=1` over repeated first-run `pip install`
 
 Run naming convention:
 - if the user does not explicitly pass a run name, generate one from the active config

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORD_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${RECORD_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${RECORD_DIR}/../../../.." && pwd)"
 CONFIG_PATH="${1:-${SCRIPT_DIR}/train_experiment_2x5090.env}"
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
@@ -22,6 +22,7 @@ set +a
 : "${DOWNLOAD_TRAIN_SHARDS:=1}"
 : "${WITH_DOCS:=0}"
 : "${SKIP_DATA_DOWNLOAD:=0}"
+: "${SKIP_PIP_INSTALL:=0}"
 
 BOOTSTRAP_STAMP="${VENV_DIR}/.bootstrap_${DOWNLOAD_VARIANT}_train${DOWNLOAD_TRAIN_SHARDS}_docs${WITH_DOCS}"
 if [[ "${FORCE_BOOTSTRAP:-0}" != "1" && -f "${BOOTSTRAP_STAMP}" ]]; then
@@ -35,9 +36,13 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
 fi
 
 PYTHON_BIN="${VENV_DIR}/bin/python"
-echo "==> Installing Python deps into ${VENV_DIR} (reusing system PyTorch)"
-"${PYTHON_BIN}" -m pip install --upgrade pip
-"${PYTHON_BIN}" -m pip install ${EXTRA_PYTHON_PACKAGES} wandb
+if [[ "${SKIP_PIP_INSTALL}" != "1" ]]; then
+  echo "==> Installing Python deps into ${VENV_DIR} (reusing system PyTorch)"
+  "${PYTHON_BIN}" -m pip install --upgrade pip
+  "${PYTHON_BIN}" -m pip install ${EXTRA_PYTHON_PACKAGES} wandb
+else
+  echo "==> Skipping pip install (SKIP_PIP_INSTALL=1); assuming deps are baked into the image"
+fi
 
 if [[ "${SKIP_DATA_DOWNLOAD}" != "1" ]]; then
   download_cmd=(

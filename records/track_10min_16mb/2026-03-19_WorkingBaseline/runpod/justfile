@@ -4,26 +4,25 @@ default:
   @just --list
 
 run run_id='' extra_env='':
-  ./pod_run.sh ./train_experiment_2x5090.env ./pod_experiment_2x5090.env "{{run_id}}" "{{extra_env}}"
+  ~/miniconda3/bin/python ./launcher.py run --run-id "{{run_id}}" --extra-env "{{extra_env}}"
 
 smoke run_id='' extra_env='':
-  ./pod_run.sh ./train_smoke_2x5090.env ./pod_experiment_2x5090.env "{{run_id}}" "{{extra_env}}"
+  ~/miniconda3/bin/python ./launcher.py smoke --run-id "{{run_id}}" --extra-env "{{extra_env}}"
 
 record run_id='' extra_env='':
-  ./pod_run.sh ./train_record_8xh100.env ./pod_record_8xh100.env "{{run_id}}" "{{extra_env}}"
+  ~/miniconda3/bin/python ./launcher.py record --run-id "{{run_id}}" --extra-env "{{extra_env}}"
 
 status:
-  ./pod_status.sh
+  ~/miniconda3/bin/python ./launcher.py status
 
 ssh:
-  resolved_pod_id=""; if [[ -f state/current_pod_id ]]; then resolved_pod_id="$(cat state/current_pod_id)"; fi; test -n "${resolved_pod_id}" || (echo "No current pod recorded in state/current_pod_id" >&2; exit 1); ssh_command="$(runpodctl ssh info "${resolved_pod_id}" -o json | ~/miniconda3/bin/python -c 'import json, sys; data = json.load(sys.stdin); cmd = data.get("ssh_command"); assert cmd, \"ssh_command not available; pod may not be ready\"; print(cmd)')"; \
-  exec ${ssh_command}
+  ~/miniconda3/bin/python ./launcher.py ssh
 
 stop:
-  ./stop_pod.sh
+  ~/miniconda3/bin/python ./launcher.py stop
 
 delete:
-  ./delete_pod.sh
+  ~/miniconda3/bin/python ./launcher.py delete
 
 summarize runs_dir="/workspace/parameter-golf/logs/record_runs":
-  ~/miniconda3/bin/python ./summarize_runs.py "{{runs_dir}}"
+  ~/miniconda3/bin/python ./launcher.py summarize --runs-dir "{{runs_dir}}"
