@@ -1,65 +1,29 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-current_pod := `test -f state/current_pod_id && cat state/current_pod_id || true`
-runpod_dir := "/Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod"
-repo_root := "/workspace/parameter-golf"
-record_root := "records/track_10min_16mb/2026-03-19_WorkingBaseline"
-
 default:
   @just --list
 
-create-experiment:
-  ./create_pod.sh ./pod_experiment_1x5090.env
+run run_id='' extra_env='':
+  ./pod_run.sh ./train_experiment_2x5090.env ./pod_experiment_2x5090.env "{{run_id}}" "{{extra_env}}"
 
-create-record:
-  ./create_pod.sh ./pod_record_8xh100.env
+smoke run_id='' extra_env='':
+  ./pod_run.sh ./train_smoke_2x5090.env ./pod_experiment_2x5090.env "{{run_id}}" "{{extra_env}}"
 
-start pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  ./start_pod.sh "{{pod_id}}"
+record run_id='' extra_env='':
+  ./pod_run.sh ./train_record_8xh100.env ./pod_record_8xh100.env "{{run_id}}" "{{extra_env}}"
 
-stop pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  ./stop_pod.sh "{{pod_id}}"
+status:
+  ./pod_status.sh
 
-delete pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  ./delete_pod.sh "{{pod_id}}"
-
-sync pod_id="{{current_pod}}":
-  ./sync_record.sh "{{pod_id}}"
-
-ssh-info pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  runpodctl ssh info "{{pod_id}}"
-
-ssh pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  ssh_command="$(runpodctl ssh info "{{pod_id}}" -o json | python3 -c 'import json, sys; data = json.load(sys.stdin); cmd = data.get("ssh_command"); assert cmd, "ssh_command not available; pod may not be ready"; print(cmd)')"
+ssh:
+  resolved_pod_id=""; if [[ -f state/current_pod_id ]]; then resolved_pod_id="$(cat state/current_pod_id)"; fi; test -n "${resolved_pod_id}" || (echo "No current pod recorded in state/current_pod_id" >&2; exit 1); ssh_command="$(runpodctl ssh info "${resolved_pod_id}" -o json | ~/miniconda3/bin/python -c 'import json, sys; data = json.load(sys.stdin); cmd = data.get("ssh_command"); assert cmd, \"ssh_command not available; pod may not be ready\"; print(cmd)')"; \
   exec ${ssh_command}
 
-bootstrap config="./train_experiment_1x5090.env" pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  ssh_json="$(runpodctl ssh info "{{pod_id}}" -o json)"
-  read -r ssh_host ssh_port ssh_key <<<"$(SSH_INFO_JSON="${ssh_json}" python3 -c 'import json, os; data = json.loads(os.environ["SSH_INFO_JSON"]); host = data.get("ip"); port = data.get("port"); key_path = (data.get("ssh_key") or {}).get("path"); assert host and port and key_path, "SSH info incomplete; pod may not be ready"; print(host, port, key_path)')"
-  ssh -o StrictHostKeyChecking=no -i "${ssh_key}" "root@${ssh_host}" -p "${ssh_port}" \
-    "cd {{repo_root}} && bash {{record_root}}/runpod/bootstrap_pod.sh {{record_root}}/runpod/{{config}}"
+stop:
+  ./stop_pod.sh
 
-run config="./train_experiment_1x5090.env" pod_id="{{current_pod}}":
-  test -n "{{pod_id}}" || (echo "No pod id provided and no current pod recorded in state/current_pod_id" >&2; exit 1)
-  ssh_json="$(runpodctl ssh info "{{pod_id}}" -o json)"
-  read -r ssh_host ssh_port ssh_key <<<"$(SSH_INFO_JSON="${ssh_json}" python3 -c 'import json, os; data = json.loads(os.environ["SSH_INFO_JSON"]); host = data.get("ip"); port = data.get("port"); key_path = (data.get("ssh_key") or {}).get("path"); assert host and port and key_path, "SSH info incomplete; pod may not be ready"; print(host, port, key_path)')"
-  ssh -o StrictHostKeyChecking=no -i "${ssh_key}" "root@${ssh_host}" -p "${ssh_port}" \
-    "cd {{repo_root}} && bash {{record_root}}/runpod/train_remote.sh {{record_root}}/runpod/{{config}}"
+delete:
+  ./delete_pod.sh
 
-smoke pod_id="{{current_pod}}":
-  just run ./train_smoke_1x5090.env "{{pod_id}}"
-
-experiment pod_id="{{current_pod}}":
-  just run ./train_experiment_1x5090.env "{{pod_id}}"
-
-record pod_id="{{current_pod}}":
-  just run ./train_record_8xh100.env "{{pod_id}}"
-
-summarize runs_dir="{{repo_root}}/logs/record_runs":
-  python3 ./summarize_runs.py "{{runs_dir}}"
+summarize runs_dir="/workspace/parameter-golf/logs/record_runs":
+  ~/miniconda3/bin/python ./summarize_runs.py "{{runs_dir}}"
