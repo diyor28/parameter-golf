@@ -59,13 +59,12 @@ The default naming scheme includes:
 - tokenizer/data variant
 - model shape
 - batch shape
-- MTP setting
 - UTC timestamp
 
 Example generated name:
 
 ```text
-experiment_2x5090_sp1024_l9d512h8kv4-relu2_tbt131072-ga1_mtp0_0320T110500Z
+experiment_2x5090_sp1024_l9d512h8kv4-relu2_tbt131072-ga1_0320T110500Z
 ```
 
 ## Diagnostics
@@ -102,29 +101,15 @@ just summarize
 ## Current experiment defaults
 
 2x5090 experiment:
-- `GRAD_ACCUM_STEPS=1`
 - `GPU_COUNT=2`
-- `TRAIN_BATCH_TOKENS=131072`
-- `VAL_BATCH_SIZE=131072`
-- `MUON_BACKEND_STEPS=4`
-- `MUON_WEIGHT_DECAY=0.01`
-- `EMA_BETA=0.999`
-- `EMA_START_PCT=0.8`
+- `TRAIN_BATCH_TOKENS=65536`
+- `VAL_BATCH_SIZE=65536`
+- `MUON_BACKEND_STEPS=5`
 
 Additional supported tuning knobs:
-- `MLP_KIND=relu2|swiglu`
-- `MLP_HIDDEN_DIM=...`
-- `MTP_DEPTH=...`
-- `MTP_WEIGHT=...`
-- `MUON_UPDATE_SCALE=...`
-- `INT8_CLIP_PERCENTILE=...`
-- `INT8_KEEP_FLOAT_MAX_NUMEL=...`
-
-Example MTP run:
-
-```bash
-just run mtp_depth1 "MTP_DEPTH=1 MTP_WEIGHT=0.3"
-```
+- `TRAIN_BATCH_TOKENS=...`
+- `VAL_BATCH_SIZE=...`
+- `ROUNDTRIP_EVAL_EVERY=...`
 
 ## Secrets
 

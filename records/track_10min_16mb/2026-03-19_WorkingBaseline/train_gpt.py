@@ -66,20 +66,15 @@ class Hyperparameters:
     roundtrip_eval_every = int(os.environ.get("ROUNDTRIP_EVAL_EVERY", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     gpu_metrics_enable = bool(int(os.environ.get("GPU_METRICS_ENABLE", "1")))
-    loader_pin_memory = bool(int(os.environ.get("LOADER_PIN_MEMORY", "1")))
-    loader_prefetch = bool(int(os.environ.get("LOADER_PREFETCH", "1")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 1))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    mtp_depth = int(os.environ.get("MTP_DEPTH", 0))
-    mtp_weight = float(os.environ.get("MTP_WEIGHT", 0.3))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -88,8 +83,6 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    mlp_kind = os.environ.get("MLP_KIND", "relu2").lower()
-    mlp_hidden_dim = int(os.environ.get("MLP_HIDDEN_DIM", "0"))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -103,12 +96,8 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
-    muon_update_scale = float(os.environ.get("MUON_UPDATE_SCALE", 1.0))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    ema_beta = float(os.environ.get("EMA_BETA", 0.0))
-    ema_start_pct = float(os.environ.get("EMA_START_PCT", 0.8))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -138,54 +127,11 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        weight_decay: float = 0.0,
-        update_scale: float = 1.0,
-        nesterov: bool = True,
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(
-                lr=lr,
-                momentum=momentum,
-                backend_steps=backend_steps,
-                weight_decay=weight_decay,
-                update_scale=update_scale,
-                nesterov=nesterov,
-            ),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
-        self._group_meta = [self._build_group_meta(group) for group in self.param_groups]
-
-    @staticmethod
-    def _build_group_meta(group: dict[str, object]) -> dict[str, object]:
-        entries: list[dict[str, object]] = []
-        total_params = 0
-        for idx, p in enumerate(group["params"]):
-            numel = int(p.numel())
-            entries.append(
-                {
-                    "index": idx,
-                    "param": p,
-                    "flat_slice": slice(total_params, total_params + numel),
-                    "scale_correction": max(1.0, p.size(0) / p.size(1)) ** 0.5,
-                }
-            )
-            total_params += numel
-        return {"entries": entries, "total_params": total_params, "owned_entries": {}, "flat_buffers": {}}
-
-    @staticmethod
-    def _owned_entries(meta: dict[str, object], world_size: int, rank: int) -> list[dict[str, object]]:
-        cache_key = (world_size, rank)
-        owned_entries = meta["owned_entries"].get(cache_key)
-        if owned_entries is None:
-            owned_entries = [entry for entry in meta["entries"] if entry["index"] % world_size == rank]
-            meta["owned_entries"][cache_key] = owned_entries
-        return owned_entries
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -198,65 +144,42 @@ class Muon(torch.optim.Optimizer):
         world_size = dist.get_world_size() if distributed else 1
         rank = dist.get_rank() if distributed else 0
 
-        for group, meta in zip(self.param_groups, self._group_meta, strict=True):
+        for group in self.param_groups:
             params = group["params"]
             if not params:
                 continue
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
-            weight_decay = group["weight_decay"]
-            update_scale = group["update_scale"]
             nesterov = group["nesterov"]
 
-            if world_size == 1:
-                for entry in meta["entries"]:
-                    p = entry["param"]
-                    if weight_decay != 0.0:
-                        p.mul_(1.0 - lr * weight_decay)
-                    if p.grad is None:
-                        continue
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(p.grad)
+                        state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(p.grad)
-                    g = p.grad.add(buf, alpha=momentum) if nesterov else buf
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= entry["scale_correction"] * update_scale
-                    p.add_(g.to(dtype=p.dtype), alpha=-lr)
-                continue
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
 
-            flat_buffer_key = (str(params[0].device), world_size)
-            updates_flat = meta["flat_buffers"].get(flat_buffer_key)
-            if updates_flat is None:
-                updates_flat = torch.zeros(meta["total_params"], device=params[0].device, dtype=torch.bfloat16)
-                meta["flat_buffers"][flat_buffer_key] = updates_flat
-            else:
-                updates_flat.zero_()
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            for entry in self._owned_entries(meta, world_size, rank):
-                p = entry["param"]
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(p.grad)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(p.grad)
-                g = p.grad.add(buf, alpha=momentum) if nesterov else buf
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                g *= entry["scale_correction"]
-                updates_flat[entry["flat_slice"]] = g.reshape(-1)
-
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            for entry in meta["entries"]:
-                p = entry["param"]
-                if weight_decay != 0.0:
-                    p.mul_(1.0 - lr * weight_decay)
-                g = updates_flat[entry["flat_slice"]].view_as(p).to(dtype=p.dtype)
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
+                curr += p.numel()
 
         return loss
 
@@ -387,27 +310,6 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-EXPORT_EXCLUDE_PREFIXES = ("mtp.",)
-
-
-def is_export_state_key(name: str) -> bool:
-    return not any(name.startswith(prefix) for prefix in EXPORT_EXCLUDE_PREFIXES)
-
-
-def exportable_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    return {name: tensor for name, tensor in state_dict.items() if is_export_state_key(name)}
-
-
-def parse_torch_dtype(name: str, default: str) -> torch.dtype:
-    dtype_name = os.environ.get(name, default)
-    try:
-        dtype = getattr(torch, dtype_name)
-    except AttributeError as exc:
-        raise ValueError(f"Unsupported torch dtype {dtype_name!r} for {name}") from exc
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"{name}={dtype_name!r} is not a torch dtype")
-    return dtype
-
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -417,9 +319,9 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     if pattern
 )
 INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
-INT8_KEEP_FLOAT_STORE_DTYPE = parse_torch_dtype("INT8_KEEP_FLOAT_STORE_DTYPE", "float16")
-INT8_PER_ROW_SCALE_DTYPE = parse_torch_dtype("INT8_PER_ROW_SCALE_DTYPE", "float16")
-INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99984))
+INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
@@ -621,64 +523,21 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(
-        self,
-        pattern: str,
-        rank: int,
-        world_size: int,
-        device: torch.device,
-        pin_memory: bool = True,
-        prefetch: bool = True,
-    ):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.pin_memory = pin_memory
-        self.prefetch = prefetch and device.type == "cuda"
         self.stream = TokenStream(pattern)
-        self.transfer_stream = torch.cuda.Stream(device=device) if self.prefetch else None
-        self._prefetched_batch: tuple[Tensor, Tensor] | None = None
-        self._prefetched_signature: tuple[int, int, int] | None = None
 
-    def _make_cpu_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
-        if self.pin_memory:
-            local = local.pin_memory()
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
-        return x, y
-
-    def _enqueue_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        x_cpu, y_cpu = self._make_cpu_batch(global_tokens, seq_len, grad_accum_steps)
-        if self.transfer_stream is None:
-            non_blocking = self.pin_memory and self.device.type == "cuda"
-            return x_cpu.to(self.device, non_blocking=non_blocking), y_cpu.to(self.device, non_blocking=non_blocking)
-        with torch.cuda.stream(self.transfer_stream):
-            x_gpu = x_cpu.to(self.device, non_blocking=True)
-            y_gpu = y_cpu.to(self.device, non_blocking=True)
-        return x_gpu, y_gpu
-
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        if self.transfer_stream is None:
-            return self._enqueue_batch(global_tokens, seq_len, grad_accum_steps)
-
-        signature = (global_tokens, seq_len, grad_accum_steps)
-        if self._prefetched_batch is None or self._prefetched_signature != signature:
-            self._prefetched_batch = self._enqueue_batch(global_tokens, seq_len, grad_accum_steps)
-            self._prefetched_signature = signature
-
-        current_stream = torch.cuda.current_stream(self.device)
-        current_stream.wait_stream(self.transfer_stream)
-        x, y = self._prefetched_batch
-        x.record_stream(current_stream)
-        y.record_stream(current_stream)
-        self._prefetched_batch = self._enqueue_batch(global_tokens, seq_len, grad_accum_steps)
-        self._prefetched_signature = signature
-        return x, y
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -790,35 +649,18 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
-def resolve_mlp_hidden_dim(dim: int, mlp_mult: int, mlp_kind: str, mlp_hidden_dim: int) -> int:
-    if mlp_hidden_dim > 0:
-        return mlp_hidden_dim
-    base_hidden = mlp_mult * dim
-    if mlp_kind == "relu2":
-        return base_hidden
-    if mlp_kind == "swiglu":
-        return max(32, int(round(((2.0 * base_hidden) / 3.0) / 32.0) * 32))
-    raise ValueError(f"Unsupported MLP_KIND={mlp_kind!r}")
-
-
 class MLP(nn.Module):
-    # Supports the original relu^2 MLP and a matched-parameter SwiGLU variant.
-    def __init__(self, dim: int, mlp_mult: int, mlp_kind: str, mlp_hidden_dim: int):
+    # relu^2 MLP from the original modded-nanogpt setup
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = resolve_mlp_hidden_dim(dim, mlp_mult, mlp_kind, mlp_hidden_dim)
-        self.kind = mlp_kind
+        hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
-        self.gate = CastedLinear(dim, hidden, bias=False) if mlp_kind == "swiglu" else None
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.kind == "relu2":
-            x = torch.relu(self.fc(x))
-            return self.proj(x.square())
-        if self.gate is None:
-            raise RuntimeError("SwiGLU MLP is missing its gate projection")
-        return self.proj(F.silu(self.fc(x)) * self.gate(x))
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
@@ -828,8 +670,6 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        mlp_kind: str,
-        mlp_hidden_dim: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -837,7 +677,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult, mlp_kind, mlp_hidden_dim)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -851,40 +691,6 @@ class Block(nn.Module):
         return x
 
 
-class MTPModule(nn.Module):
-    # Follows the DeepSeek-V3 recipe: combine the current hidden state with the
-    # teacher-forced next-token embedding, then refine it with a lightweight
-    # transformer block that shares the main embedding/output head path.
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        mlp_kind: str,
-        mlp_hidden_dim: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
-        super().__init__()
-        self.input_proj = CastedLinear(2 * dim, dim, bias=False)
-        self.block = Block(
-            dim,
-            num_heads,
-            num_kv_heads,
-            mlp_mult,
-            mlp_kind,
-            mlp_hidden_dim,
-            rope_base,
-            qk_gain_init,
-        )
-
-    def forward(self, hidden: Tensor, teacher_emb: Tensor) -> Tensor:
-        x = self.input_proj(torch.cat((hidden, teacher_emb), dim=-1))
-        x = F.rms_norm(x, (x.size(-1),))
-        return self.block(x, x)
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -894,15 +700,11 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        mlp_kind: str,
-        mlp_hidden_dim: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        mtp_depth: int,
-        mtp_weight: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -910,8 +712,6 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.mtp_depth = mtp_depth
-        self.mtp_weight = mtp_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -924,8 +724,6 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
-                    mlp_kind,
-                    mlp_hidden_dim,
                     rope_base,
                     qk_gain_init,
                 )
@@ -936,21 +734,6 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self.mtp = nn.ModuleList(
-            [
-                MTPModule(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    mlp_kind,
-                    mlp_hidden_dim,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for _ in range(mtp_depth)
-            ]
-        )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -993,34 +776,9 @@ class GPT(nn.Module):
         logits = self.logits_from_hidden(hidden)
         return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
 
-    def mtp_aux_loss(self, hidden: Tensor, target_ids: Tensor) -> Tensor | None:
-        if self.mtp_depth <= 0 or self.mtp_weight <= 0.0 or target_ids.size(1) <= 1:
-            return None
-        current_hidden = hidden
-        loss_sum: Tensor | None = None
-        active_depths = 0
-        for depth_idx, mtp_module in enumerate(self.mtp):
-            if current_hidden.size(1) <= 1:
-                break
-            current_hidden = current_hidden[:, :-1, :]
-            teacher_tokens = target_ids[:, depth_idx : depth_idx + current_hidden.size(1)]
-            future_targets = target_ids[:, depth_idx + 1 : depth_idx + 1 + current_hidden.size(1)]
-            teacher_emb = self.embed_inputs(teacher_tokens)
-            current_hidden = mtp_module(current_hidden, teacher_emb)
-            depth_loss = self.loss_from_hidden(current_hidden, future_targets)
-            loss_sum = depth_loss if loss_sum is None else loss_sum + depth_loss
-            active_depths += 1
-        return loss_sum / active_depths if loss_sum is not None and active_depths > 0 else None
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         hidden = self.hidden_states(input_ids)
-        main_loss = self.loss_from_hidden(hidden, target_ids)
-        mtp_loss = self.mtp_aux_loss(hidden, target_ids) if self.training else None
-        if mtp_loss is None:
-            zero_mtp_loss = main_loss.detach().new_zeros(())
-            return main_loss, main_loss, zero_mtp_loss
-        total_loss = main_loss + self.mtp_weight * mtp_loss
-        return total_loss, main_loss, mtp_loss
+        return self.loss_from_hidden(hidden, target_ids)
 
 
 # -----------------------------
@@ -1032,20 +790,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.mlp_kind not in {"relu2", "swiglu"}:
-        raise ValueError(f"MLP_KIND must be one of ('relu2', 'swiglu'), got {args.mlp_kind!r}")
-    if args.mtp_depth < 0:
-        raise ValueError(f"MTP_DEPTH must be non-negative, got {args.mtp_depth}")
-    if args.mtp_weight < 0.0:
-        raise ValueError(f"MTP_WEIGHT must be non-negative, got {args.mtp_weight}")
-    if not 0.0 <= args.ema_start_pct <= 1.0:
-        raise ValueError(f"EMA_START_PCT must be in [0, 1], got {args.ema_start_pct}")
-    if args.ema_beta < 0.0 or args.ema_beta >= 1.0:
-        raise ValueError(f"EMA_BETA must be in [0, 1), got {args.ema_beta}")
-    if not 0.0 < INT8_CLIP_PERCENTILE <= 100.0:
-        raise ValueError(f"INT8_CLIP_PERCENTILE must be in (0, 100], got {INT8_CLIP_PERCENTILE}")
-    resolved_mlp_hidden_dim = resolve_mlp_hidden_dim(args.model_dim, args.mlp_mult, args.mlp_kind, args.mlp_hidden_dim)
-    ema_start_step = min(args.iterations, max(1, math.ceil(args.iterations * args.ema_start_pct))) if args.ema_beta > 0.0 else None
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1058,15 +802,9 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    grad_accum_steps = args.grad_accum_steps
-    if grad_accum_steps <= 0:
-        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
-    batch_shape_denom = world_size * grad_accum_steps * args.train_seq_len
-    if args.train_batch_tokens % batch_shape_denom != 0:
-        raise ValueError(
-            "TRAIN_BATCH_TOKENS must be divisible by WORLD_SIZE * GRAD_ACCUM_STEPS * TRAIN_SEQ_LEN; "
-            f"got {args.train_batch_tokens} vs {world_size} * {grad_accum_steps} * {args.train_seq_len}"
-        )
+    if 8 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     seqs_per_optimizer_step = args.train_batch_tokens // args.train_seq_len
     tokens_per_microstep = args.train_batch_tokens // grad_accum_steps
@@ -1122,25 +860,11 @@ def main() -> None:
         "tokens_per_microstep": tokens_per_microstep,
         "seqs_per_optimizer_step": seqs_per_optimizer_step,
         "seqs_per_microstep": seqs_per_microstep,
-        "mlp_kind": args.mlp_kind,
-        "mlp_hidden_dim": resolved_mlp_hidden_dim,
-        "mtp_depth": args.mtp_depth,
-        "mtp_weight": args.mtp_weight,
         "muon_backend_steps": args.muon_backend_steps,
-        "muon_weight_decay": args.muon_weight_decay,
-        "muon_update_scale": args.muon_update_scale,
-        "ema_beta": args.ema_beta,
-        "ema_start_pct": args.ema_start_pct,
-        "loader_pin_memory": args.loader_pin_memory,
-        "loader_prefetch": args.loader_prefetch,
         "iterations": args.iterations,
         "max_wallclock_seconds": args.max_wallclock_seconds,
         "tokenizer_path": args.tokenizer_path,
         "data_path": args.data_path,
-        "int8_clip_percentile": INT8_CLIP_PERCENTILE,
-        "int8_keep_float_max_numel": INT8_KEEP_FLOAT_MAX_NUMEL,
-        "int8_keep_float_store_dtype": str(INT8_KEEP_FLOAT_STORE_DTYPE).removeprefix("torch."),
-        "int8_per_row_scale_dtype": str(INT8_PER_ROW_SCALE_DTYPE).removeprefix("torch."),
     }
 
     def log0(msg: str, console: bool = True) -> None:
@@ -1194,27 +918,13 @@ def main() -> None:
                 "train_log_every": args.train_log_every,
                 "gpu_metrics_enable": args.gpu_metrics_enable,
                 "muon_backend_steps": args.muon_backend_steps,
-                "loader_pin_memory": args.loader_pin_memory,
-                "loader_prefetch": args.loader_prefetch,
                 "vocab_size": args.vocab_size,
                 "num_layers": args.num_layers,
                 "model_dim": args.model_dim,
                 "num_heads": args.num_heads,
                 "num_kv_heads": args.num_kv_heads,
                 "mlp_mult": args.mlp_mult,
-                "mlp_kind": args.mlp_kind,
-                "mlp_hidden_dim": resolved_mlp_hidden_dim,
-                "mtp_depth": args.mtp_depth,
-                "mtp_weight": args.mtp_weight,
                 "tie_embeddings": args.tie_embeddings,
-                "muon_weight_decay": args.muon_weight_decay,
-                "muon_update_scale": args.muon_update_scale,
-                "ema_beta": args.ema_beta,
-                "ema_start_pct": args.ema_start_pct,
-                "int8_clip_percentile": INT8_CLIP_PERCENTILE,
-                "int8_keep_float_max_numel": INT8_KEEP_FLOAT_MAX_NUMEL,
-                "int8_keep_float_store_dtype": str(INT8_KEEP_FLOAT_STORE_DTYPE).removeprefix("torch."),
-                "int8_per_row_scale_dtype": str(INT8_PER_ROW_SCALE_DTYPE).removeprefix("torch."),
                 "data_path": args.data_path,
                 "tokenizer_path": args.tokenizer_path,
                 "seed": args.seed,
@@ -1231,10 +941,6 @@ def main() -> None:
         tokens_per_microstep=tokens_per_microstep,
         seqs_per_optimizer_step=seqs_per_optimizer_step,
         seqs_per_microstep=seqs_per_microstep,
-        mlp_kind=args.mlp_kind,
-        mlp_hidden_dim=resolved_mlp_hidden_dim,
-        mtp_depth=args.mtp_depth,
-        mtp_weight=args.mtp_weight,
         iterations=args.iterations,
         max_wallclock_seconds=args.max_wallclock_seconds,
         tokenizer_path=args.tokenizer_path,
@@ -1250,9 +956,6 @@ def main() -> None:
                 "run/tokens_per_microstep": tokens_per_microstep,
                 "run/seqs_per_optimizer_step": seqs_per_optimizer_step,
                 "run/seqs_per_microstep": seqs_per_microstep,
-                "run/mlp_hidden_dim": resolved_mlp_hidden_dim,
-                "run/mtp_depth": args.mtp_depth,
-                "run/mtp_weight": args.mtp_weight,
                 "run/muon_backend_steps": args.muon_backend_steps,
             },
             step=0,
@@ -1323,15 +1026,11 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
-        mlp_kind=args.mlp_kind,
-        mlp_hidden_dim=resolved_mlp_hidden_dim,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        mtp_depth=args.mtp_depth,
-        mtp_weight=args.mtp_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1346,7 +1045,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    block_named_params.extend((f"mtp.{name}", p) for name, p in base_model.mtp.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1371,8 +1069,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        weight_decay=args.muon_weight_decay,
-        update_scale=args.muon_update_scale,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1393,8 +1089,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    exportable_param_count = sum(p.numel() for name, p in base_model.named_parameters() if is_export_state_key(name))
-    mtp_param_count = n_params - exportable_param_count
+    exportable_param_count = sum(p.numel() for _name, p in base_model.named_parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1404,16 +1099,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    log0(
-        f"mlp_kind:{args.mlp_kind} mlp_hidden_dim:{resolved_mlp_hidden_dim} "
-        f"mtp_depth:{args.mtp_depth} mtp_weight:{args.mtp_weight} "
-        f"loader:pin_memory:{args.loader_pin_memory} prefetch:{args.loader_prefetch}"
-    )
-    log0(
-        f"muon_backend_steps:{args.muon_backend_steps} muon_weight_decay:{args.muon_weight_decay} "
-        f"muon_update_scale:{args.muon_update_scale} ema_beta:{args.ema_beta} "
-        f"ema_start_pct:{args.ema_start_pct} int8_clip_percentile:{INT8_CLIP_PERCENTILE}"
-    )
+    log0(f"muon_backend_steps:{args.muon_backend_steps}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1422,28 +1108,17 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     summary_data["model_params"] = int(n_params)
     summary_data["exportable_model_params"] = int(exportable_param_count)
-    summary_data["mtp_params"] = int(mtp_param_count)
     summary_data["seed"] = args.seed
     emit_event(
         "config",
         model_params=int(n_params),
         exportable_model_params=int(exportable_param_count),
-        mtp_params=int(mtp_param_count),
         num_layers=args.num_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
-        mlp_kind=args.mlp_kind,
-        mlp_hidden_dim=resolved_mlp_hidden_dim,
-        mtp_depth=args.mtp_depth,
-        mtp_weight=args.mtp_weight,
         tie_embeddings=bool(args.tie_embeddings),
-        muon_weight_decay=args.muon_weight_decay,
-        muon_update_scale=args.muon_update_scale,
-        ema_beta=args.ema_beta,
-        ema_start_pct=args.ema_start_pct,
-        int8_clip_percentile=INT8_CLIP_PERCENTILE,
         seed=args.seed,
     )
     if wandb_run is not None:
@@ -1451,7 +1126,6 @@ def main() -> None:
             {
                 "model_params": int(n_params),
                 "exportable_model_params": int(exportable_param_count),
-                "mtp_params": int(mtp_param_count),
             },
             allow_val_change=True,
         )
@@ -1465,42 +1139,15 @@ def main() -> None:
         rank,
         world_size,
         device,
-        pin_memory=args.loader_pin_memory,
-        prefetch=args.loader_prefetch,
     )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    ema_params: dict[str, Tensor] | None = None
-
-    def update_ema(step: int, elapsed_ms: float) -> None:
-        nonlocal ema_params
-        if args.ema_beta <= 0.0:
-            return
-        if ema_start_ms is not None:
-            if elapsed_ms < ema_start_ms:
-                return
-        elif ema_start_step is None or step < ema_start_step:
-            return
-        if ema_params is None:
-            ema_params = {name: param.detach().float().clone() for name, param in base_model.named_parameters()}
-            return
-        one_minus_beta = 1.0 - args.ema_beta
-        for name, param in base_model.named_parameters():
-            ema_params[name].lerp_(param.detach().float(), one_minus_beta)
-
-    def maybe_apply_ema_weights() -> bool:
-        if ema_params is None:
-            return False
-        for name, param in base_model.named_parameters():
-            param.data.copy_(ema_params[name].to(device=param.device, dtype=param.dtype))
-        return True
-
     def eval_quantized_roundtrip(step: int, training_time_ms: float) -> tuple[float, float, float]:
         current_state = {name: tensor.detach().to("cpu").clone() for name, tensor in base_model.state_dict().items()}
-        quant_obj, _ = quantize_state_dict_int8(exportable_state_dict(current_state))
+        quant_obj, _ = quantize_state_dict_int8(current_state)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_state = torch.load(io.BytesIO(zlib.decompress(zlib.compress(quant_buf.getvalue(), level=9))), map_location="cpu")
@@ -1558,7 +1205,6 @@ def main() -> None:
         return q_val_loss, q_val_bpb, eval_time_ms
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    ema_start_ms = max_wallclock_ms * args.ema_start_pct if args.ema_beta > 0.0 and max_wallclock_ms is not None else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1602,8 +1248,6 @@ def main() -> None:
             rank,
             world_size,
             device,
-            pin_memory=args.loader_pin_memory,
-            prefetch=args.loader_prefetch,
         )
 
     # -----------------------------
@@ -1728,21 +1372,15 @@ def main() -> None:
         if gpu_step_start is not None:
             gpu_step_start.record()
         train_loss = torch.zeros((), device=device)
-        train_main_loss = torch.zeros((), device=device)
-        train_mtp_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss, main_loss, mtp_loss = model(x, y)
+                loss = model(x, y)
             train_loss += loss.detach()
-            train_main_loss += main_loss.detach()
-            train_mtp_loss += mtp_loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        train_main_loss /= grad_accum_steps
-        train_mtp_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1763,7 +1401,6 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        update_ema(step, approx_training_time_ms)
         should_log_train = profile_train_step
         if should_log_train:
             torch.cuda.synchronize()
@@ -1785,19 +1422,14 @@ def main() -> None:
             }
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"main_loss:{train_main_loss.item():.4f} mtp_loss:{train_mtp_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
             train_loss_value = float(train_loss.item())
-            train_main_loss_value = float(train_main_loss.item())
-            train_mtp_loss_value = float(train_mtp_loss.item())
             best_train_loss = train_loss_value if best_train_loss is None else min(best_train_loss, train_loss_value)
             summary_data["last_train"] = {
                 "step": step,
                 "tokens_seen": step * args.train_batch_tokens,
                 "train_loss": train_loss_value,
-                "main_loss": train_main_loss_value,
-                "mtp_loss": train_mtp_loss_value,
                 "train_time_ms": approx_training_time_ms,
                 "step_avg_ms": approx_training_time_ms / step,
             }
@@ -1809,8 +1441,6 @@ def main() -> None:
                 iterations=args.iterations,
                 tokens_seen=step * args.train_batch_tokens,
                 train_loss=train_loss_value,
-                main_loss=train_main_loss_value,
-                mtp_loss=train_mtp_loss_value,
                 train_time_ms=approx_training_time_ms,
                 step_avg_ms=approx_training_time_ms / step,
                 **perf_metrics,
@@ -1820,8 +1450,6 @@ def main() -> None:
                     {
                         "tokens_seen": step * args.train_batch_tokens,
                         "train/loss": train_loss_value,
-                        "train/main_loss": train_main_loss_value,
-                        "train/mtp_loss": train_mtp_loss_value,
                         "time/train_ms": approx_training_time_ms,
                         "time/step_avg_ms": approx_training_time_ms / step,
                         "optim/lr_scale": scale,
@@ -1865,22 +1493,6 @@ def main() -> None:
         wandb_run.summary["training_time_ms"] = training_time_ms
         wandb_run.summary["completed_steps"] = step
         wandb_run.summary["tokens_seen"] = step * args.train_batch_tokens
-    ema_applied = maybe_apply_ema_weights()
-    summary_data["ema_applied_to_final"] = ema_applied
-    if wandb_run is not None:
-        wandb_run.summary["ema_applied_to_final"] = ema_applied
-    if ema_applied:
-        log0(
-            f"Applying EMA weights for final export/eval (beta={args.ema_beta}, "
-            f"start_step={ema_start_step}, start_ms:{ema_start_ms if ema_start_ms is not None else -1:.0f})"
-        )
-        emit_event(
-            "ema_final",
-            beta=args.ema_beta,
-            start_step=ema_start_step,
-            start_ms=ema_start_ms,
-            completed_steps=step,
-        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1890,7 +1502,7 @@ def main() -> None:
 
     if master_process:
         final_model_path = os.path.join(artifacts_dir, "final_model.pt")
-        torch.save(exportable_state_dict(base_model.state_dict()), final_model_path)
+        torch.save(base_model.state_dict(), final_model_path)
         model_bytes = os.path.getsize(final_model_path)
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
@@ -1912,7 +1524,7 @@ def main() -> None:
             wandb_run.summary["code_bytes"] = code_bytes
             wandb_run.summary["submission_size_bytes"] = model_bytes + code_bytes
 
-    quant_obj, quant_stats = quantize_state_dict_int8(exportable_state_dict(base_model.state_dict()))
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
