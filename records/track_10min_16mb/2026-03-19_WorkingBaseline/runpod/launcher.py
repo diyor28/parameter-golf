@@ -15,7 +15,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORD_DIR = SCRIPT_DIR.parent
-REPO_ROOT_LOCAL = SCRIPT_DIR.parents[4]
+REPO_ROOT_LOCAL = SCRIPT_DIR.parents[3]
 STATE_ROOT = SCRIPT_DIR / "state"
 CURRENT_POD_ID_PATH = STATE_ROOT / "current_pod_id"
 CURRENT_POD_JSON_PATH = STATE_ROOT / "current_pod.json"
@@ -28,7 +28,7 @@ DEFAULT_RECORD_POD_CONFIG = SCRIPT_DIR / "pod_record_8xh100.env"
 DEFAULT_RECORD_TRAIN_CONFIG = SCRIPT_DIR / "train_record_8xh100.env"
 DEFAULT_SMOKE_TRAIN_CONFIG = SCRIPT_DIR / "train_smoke_2x5090.env"
 
-SHELL_DEFAULT_RE = re.compile(r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)[:-](?P<default>.*)\}$")
+SHELL_DEFAULT_RE = re.compile(r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\:\-(?P<default>.*)\}$")
 
 
 def eprint(msg: str) -> None:
@@ -49,6 +49,15 @@ def run(
         text=True,
         capture_output=capture_output,
     )
+
+
+def format_completed_error(exc: subprocess.CalledProcessError) -> str:
+    parts = [f"Command failed: {' '.join(exc.cmd)}"]
+    if exc.stdout:
+        parts.append(exc.stdout.strip())
+    if exc.stderr:
+        parts.append(exc.stderr.strip())
+    return "\n".join(part for part in parts if part)
 
 
 def stream(args: list[str], *, cwd: Path | None = None) -> int:
@@ -148,7 +157,7 @@ def ssh_parts(pod_id: str) -> tuple[str, str, str, str]:
     key_path = (info.get("ssh_key") or {}).get("path")
     ssh_command = info.get("ssh_command")
     if not all((host, port, key_path, ssh_command)):
-        raise SystemExit(f"SSH info incomplete for pod {pod_id}")
+        raise RuntimeError(f"SSH info incomplete for pod {pod_id}")
     return str(host), str(port), str(key_path), str(ssh_command)
 
 
@@ -180,7 +189,7 @@ def wait_for_ssh_ready(pod_id: str, attempts: int = 60, interval_seconds: int = 
             save_current_pod_state(pod_id, info)
             return info
         time.sleep(interval_seconds)
-    raise SystemExit(f"Timed out waiting for SSH readiness on pod {pod_id}")
+    raise TimeoutError(f"Timed out waiting for SSH readiness on pod {pod_id}")
 
 
 def find_reusable_pod_id(name: str) -> str | None:
@@ -242,7 +251,10 @@ def create_pod(config: dict[str, str]) -> str:
         cmd.append("--global-networking")
 
     eprint(f"==> Creating pod {config.get('POD_NAME', 'pgolf-working')}")
-    result = run(cmd)
+    try:
+        result = run(cmd)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(format_completed_error(exc))
     data = json.loads(result.stdout)
     if isinstance(data, list):
         data = data[0] if data else {}
@@ -253,8 +265,7 @@ def create_pod(config: dict[str, str]) -> str:
     return str(pod_id)
 
 
-def ensure_pod_ready(pod_config_path: Path) -> str:
-    config = parse_env_file(pod_config_path)
+def ensure_pod_ready_from_config(config: dict[str, str]) -> str:
     pod_name = config.get("POD_NAME", "pgolf-working")
     wait_for_ssh = config.get("WAIT_FOR_SSH", "1") == "1"
     attempts = int(config.get("WAIT_FOR_SSH_ATTEMPTS", "60"))
@@ -269,6 +280,10 @@ def ensure_pod_ready(pod_config_path: Path) -> str:
     if wait_for_ssh:
         wait_for_ssh_ready(pod_id, attempts, interval)
     return pod_id
+
+
+def ensure_pod_ready(pod_config_path: Path) -> str:
+    return ensure_pod_ready_from_config(parse_env_file(pod_config_path))
 
 
 def remote_ssh_base(pod_id: str) -> list[str]:
@@ -343,10 +358,6 @@ def remote_training_running(pod_id: str) -> bool:
         "    pid = lock.read_text().strip()\n"
         "    if pid.isdigit() and subprocess.run(['kill', '-0', pid]).returncode == 0:\n"
         "        raise SystemExit(0)\n"
-        "procs = subprocess.run(['ps', '-eo', 'pid=,args='], text=True, capture_output=True, check=True).stdout.splitlines()\n"
-        "for line in procs:\n"
-        "    if 'train_gpt.py' in line or 'torchrun' in line or 'torch.distributed.run' in line:\n"
-        "        raise SystemExit(0)\n"
         "raise SystemExit(1)\n"
         "PY",
         check=False,
@@ -355,10 +366,14 @@ def remote_training_running(pod_id: str) -> bool:
     return result.returncode == 0
 
 
-def remote_bootstrap(pod_id: str, train_config_path: Path) -> None:
+def remote_bootstrap(pod_id: str, train_config_path: Path, env_overrides: dict[str, str] | None = None) -> None:
     eprint("==> Running remote bootstrap")
+    export_parts = []
+    for key, value in (env_overrides or {}).items():
+        export_parts.append(f"export {key}={shlex.quote(value)};")
     ssh_cmd = (
         f"cd {shlex.quote(REPO_ROOT_REMOTE)} && "
+        f"{' '.join(export_parts)} "
         f"bash {shlex.quote(f'{REPO_ROOT_REMOTE}/{RECORD_ROOT_REMOTE}/runpod/remote_bootstrap.sh')} "
         f"{shlex.quote(f'{REPO_ROOT_REMOTE}/{RECORD_ROOT_REMOTE}/runpod/{train_config_path.name}')}"
     )
@@ -374,6 +389,13 @@ def load_secrets() -> dict[str, str]:
     return parse_env_file(secrets_path)
 
 
+def local_git_commit() -> str:
+    try:
+        return run(["git", "-C", str(REPO_ROOT_LOCAL), "rev-parse", "HEAD"]).stdout.strip()
+    except subprocess.CalledProcessError:
+        return "snapshot-no-git"
+
+
 def remote_train(pod_id: str, train_config_path: Path, run_id: str, extra_env: dict[str, str], auto_stop: bool = True) -> int:
     secrets = load_secrets()
     exports: dict[str, str] = {}
@@ -382,6 +404,8 @@ def remote_train(pod_id: str, train_config_path: Path, run_id: str, extra_env: d
         exports["WANDB_RUN_NAME"] = run_id
     if api_key := secrets.get("WANDB_API_KEY"):
         exports["WANDB_API_KEY"] = api_key
+    exports["RUNPOD_POD_ID"] = pod_id
+    exports["SOURCE_GIT_COMMIT"] = local_git_commit()
     exports.update(extra_env)
     export_parts = [f"export {key}={shlex.quote(value)};" for key, value in exports.items()]
     remote_cmd = (
@@ -466,13 +490,36 @@ def delete_command(pod_id: str | None) -> int:
     return 0
 
 
+def delete_pod_best_effort(pod_id: str | None) -> None:
+    if not pod_id:
+        return
+    subprocess.run(["runpodctl", "pod", "stop", pod_id], text=True, capture_output=True)
+    subprocess.run(["runpodctl", "pod", "delete", pod_id], text=True, capture_output=True)
+    clear_current_pod_state(pod_id)
+
+
 def run_command(train_config: Path, pod_config: Path, run_id: str, extra_env_raw: str) -> int:
-    pod_id = ensure_pod_ready(pod_config)
+    extra_env = parse_extra_env(extra_env_raw)
+    bootstrap_overrides: dict[str, str] = {}
+    pod_values = parse_env_file(pod_config)
+    try:
+        pod_id = ensure_pod_ready_from_config(pod_values)
+    except TimeoutError:
+        if pod_values.get("RUNPOD_IMAGE", "").strip() and pod_values.get("RUNPOD_TEMPLATE_ID", "").strip():
+            failed_pod_id = CURRENT_POD_ID_PATH.read_text(encoding="utf-8").strip() if CURRENT_POD_ID_PATH.exists() else None
+            eprint("==> Custom image pod never became SSH-ready; deleting it and retrying with the stock template")
+            delete_pod_best_effort(failed_pod_id)
+            fallback_values = dict(pod_values)
+            fallback_values["RUNPOD_IMAGE"] = ""
+            bootstrap_overrides["SKIP_PIP_INSTALL"] = "0"
+            pod_id = ensure_pod_ready_from_config(fallback_values)
+        else:
+            raise
     if remote_training_running(pod_id):
         raise SystemExit(f"A training process is already running on pod {pod_id}. Use 'just status' to inspect it.")
     sync_repo_snapshot(pod_id)
-    remote_bootstrap(pod_id, train_config)
-    return remote_train(pod_id, train_config, run_id, parse_extra_env(extra_env_raw))
+    remote_bootstrap(pod_id, train_config, bootstrap_overrides)
+    return remote_train(pod_id, train_config, run_id, {**bootstrap_overrides, **extra_env})
 
 
 def build_parser() -> argparse.ArgumentParser:

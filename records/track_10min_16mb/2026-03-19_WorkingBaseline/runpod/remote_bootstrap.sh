@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORD_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${RECORD_DIR}/../../../.." && pwd)"
+REPO_ROOT="$(cd "${RECORD_DIR}/../../.." && pwd)"
 CONFIG_PATH="${1:-${SCRIPT_DIR}/train_experiment_2x5090.env}"
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then

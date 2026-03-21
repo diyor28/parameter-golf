@@ -1,6 +1,4 @@
-FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
-
-WORKDIR /workspace
+FROM --platform=linux/amd64 runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
 COPY requirements.txt /tmp/pgolf-requirements.txt
 

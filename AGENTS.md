@@ -40,6 +40,7 @@ Important conventions:
 - do not preserve obsolete compatibility wrappers just to avoid churn
 - prefer a single obvious happy path over multiple overlapping ways to do the same thing
 - the local run launcher should stop the pod automatically when training finishes
+- auto-stop should not depend only on the local foreground process; keep a remote self-stop path as the primary safeguard and the local launcher stop as a backup
 - the default workflow should reuse an existing matching running pod when possible, otherwise create a fresh pod
 - the default experiment launch path should use `rsync`, not `scp`
 - the local repo snapshot is the source of truth; do not manage the remote workspace with `git pull` / `git checkout`

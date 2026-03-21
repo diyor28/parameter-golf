@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORD_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${RECORD_DIR}/../../../.." && pwd)"
+REPO_ROOT="$(cd "${RECORD_DIR}/../../.." && pwd)"
 CONFIG_PATH="${1:-${SCRIPT_DIR}/train_experiment_2x5090.env}"
 SECRETS_PATH="${SCRIPT_DIR}/secrets.env"
 
@@ -72,6 +72,9 @@ fi
 
 RUN_DIR="${REPO_ROOT}/logs/record_runs/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
+RUNTIME_DIR="/workspace/pgolf-runtime"
+mkdir -p "${RUNTIME_DIR}"
+TRAIN_PID_FILE="${RUNTIME_DIR}/train.pid"
 
 if [[ "${INSTALL_REQUIREMENTS}" == "1" ]]; then
   if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
@@ -122,7 +125,13 @@ fi
   env | LC_ALL=C sort
 } > "${RUN_DIR}/run.env"
 
-git -C "${REPO_ROOT}" rev-parse HEAD > "${RUN_DIR}/git_commit.txt"
+if [[ -n "${SOURCE_GIT_COMMIT:-}" ]]; then
+  printf '%s\n' "${SOURCE_GIT_COMMIT}" > "${RUN_DIR}/git_commit.txt"
+elif git -C "${REPO_ROOT}" rev-parse HEAD > "${RUN_DIR}/git_commit.txt" 2>/dev/null; then
+  :
+else
+  printf 'snapshot-no-git\n' > "${RUN_DIR}/git_commit.txt"
+fi
 
 TRAIN_LOG="${RUN_DIR}/train.log"
 CONSOLE_LOG="${RUN_DIR}/console.log"
@@ -136,6 +145,25 @@ export RUN_ID
 export DATA_PATH
 export TOKENIZER_PATH
 export EXPERIMENT_DIR="${RUN_DIR}"
+
+schedule_remote_pod_stop() {
+  if [[ -z "${RUNPOD_POD_ID:-}" ]]; then
+    return 0
+  fi
+  if ! command -v runpodctl >/dev/null 2>&1; then
+    return 0
+  fi
+  local delay_seconds="${RUNPOD_AUTO_STOP_DELAY_SECONDS:-8}"
+  local stop_log="${RUN_DIR}/remote_stop.log"
+  nohup bash -lc "sleep ${delay_seconds}; runpodctl pod stop ${RUNPOD_POD_ID}" > "${stop_log}" 2>&1 </dev/null &
+}
+
+echo $$ > "${TRAIN_PID_FILE}"
+cleanup() {
+  rm -f "${TRAIN_PID_FILE}"
+  schedule_remote_pod_stop
+}
+trap cleanup EXIT
 
 set -o pipefail
 if [[ -x "${TORCHRUN_BIN}" ]]; then

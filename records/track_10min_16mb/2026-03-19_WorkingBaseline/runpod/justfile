@@ -12,17 +12,17 @@ smoke run_id='' extra_env='':
 record run_id='' extra_env='':
   ~/miniconda3/bin/python ./launcher.py record --run-id "{{run_id}}" --extra-env "{{extra_env}}"
 
-status:
-  ~/miniconda3/bin/python ./launcher.py status
+status pod_id='':
+  if [[ -n "{{pod_id}}" ]]; then ~/miniconda3/bin/python ./launcher.py status --pod-id "{{pod_id}}"; else ~/miniconda3/bin/python ./launcher.py status; fi
 
-ssh:
-  ~/miniconda3/bin/python ./launcher.py ssh
+ssh pod_id='':
+  if [[ -n "{{pod_id}}" ]]; then ~/miniconda3/bin/python ./launcher.py ssh --pod-id "{{pod_id}}"; else ~/miniconda3/bin/python ./launcher.py ssh; fi
 
-stop:
-  ~/miniconda3/bin/python ./launcher.py stop
+stop pod_id='':
+  if [[ -n "{{pod_id}}" ]]; then ~/miniconda3/bin/python ./launcher.py stop --pod-id "{{pod_id}}"; else ~/miniconda3/bin/python ./launcher.py stop; fi
 
-delete:
-  ~/miniconda3/bin/python ./launcher.py delete
+delete pod_id='':
+  if [[ -n "{{pod_id}}" ]]; then ~/miniconda3/bin/python ./launcher.py delete --pod-id "{{pod_id}}"; else ~/miniconda3/bin/python ./launcher.py delete; fi
 
 summarize runs_dir="/workspace/parameter-golf/logs/record_runs":
   ~/miniconda3/bin/python ./launcher.py summarize --runs-dir "{{runs_dir}}"

@@ -16,6 +16,10 @@ just run
 - launches training
 - stops the pod automatically when the run finishes
 
+Auto-stop is layered on purpose:
+- the remote training script now schedules a `podStop` call itself via the Runpod API
+- the local launcher still issues a stop request in its `finally` block as a backup
+
 ## Everyday commands
 
 Run the normal 2x5090 experiment:
@@ -75,6 +79,7 @@ These are the only `just` diagnostics we keep surfaced:
 just status
 just ssh
 just stop
+just stop qc6w4g4h2kzn7m
 just delete
 just summarize
 ```
