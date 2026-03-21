@@ -27,14 +27,15 @@ sanitize_name_part() {
 }
 
 build_default_run_name() {
-  local purpose hardware variant arch batch timestamp
+  local purpose hardware variant arch batch toggles timestamp
   purpose="$(sanitize_name_part "${RUN_PURPOSE:-experiment}")"
   hardware="$(sanitize_name_part "${RUN_HARDWARE:-${GPU_COUNT:-1}gpu}")"
   variant="$(sanitize_name_part "${DOWNLOAD_VARIANT:-sp1024}")"
-  arch="l${NUM_LAYERS:-9}d${MODEL_DIM:-512}h${NUM_HEADS:-8}kv${NUM_KV_HEADS:-4}-relu2"
-  batch="tbt${TRAIN_BATCH_TOKENS:-0}"
+  arch="l${NUM_LAYERS:-9}d${MODEL_DIM:-512}h${NUM_HEADS:-8}kv${NUM_KV_HEADS:-4}m${MLP_MULT:-2}s${TRAIN_SEQ_LEN:-1024}"
+  batch="tbt${TRAIN_BATCH_TOKENS:-0}ga${GRAD_ACCUM_STEPS:-auto}"
+  toggles="bg${BIGRAM_DIM:-0}-xsa${XSA_LAST_N:-0}-rp${ROPE_DIMS:-0}-ln${LN_SCALE:-0}-qat${LATE_QAT:-0}-ttt${TTT_ENABLED:-0}"
   timestamp="$(date -u +%m%dT%H%M%SZ)"
-  printf '%s_%s_%s_%s_%s_%s\n' "${purpose}" "${hardware}" "${variant}" "${arch}" "${batch}" "${timestamp}"
+  printf '%s_%s_%s_%s_%s_%s_%s\n' "${purpose}" "${hardware}" "${variant}" "${arch}" "${batch}" "${toggles}" "${timestamp}"
 }
 
 : "${PYTHON_BIN:=python3}"

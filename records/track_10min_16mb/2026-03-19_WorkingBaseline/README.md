@@ -1,7 +1,9 @@
-This folder is a working copy of the baseline trainer for iterative baseline-focused work.
+This folder is a working copy of the baseline trainer for iterative record-track work.
 
 Contents:
-- `train_gpt.py`: copied from the baseline record and intended to be edited here
+- `train_gpt.py`: the active working trainer, now carrying the stronger record-style stack
+  (11L/512/MLP3x, SmearGate, BigramHash, XSA, partial RoPE, LN scale, late QAT,
+  mixed int5/int6 + zstd, sliding-window eval, and causal TTT)
 - `runpod/`: Python launcher, remote training payloads, and configs for this record
 
 Recommended flow:

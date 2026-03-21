@@ -68,7 +68,7 @@ The default naming scheme includes:
 Example generated name:
 
 ```text
-experiment_2x5090_sp1024_l9d512h8kv4-relu2_tbt65536_0320T110500Z
+experiment_2x5090_sp1024_l11d512h8kv4m3s2048_tbt262144ga4_bg64-xsa4-rp32-ln1-qat1-ttt1_0320T110500Z
 ```
 
 ## Diagnostics
@@ -107,15 +107,32 @@ just summarize
 
 2x5090 experiment:
 - `GPU_COUNT=2`
-- `TRAIN_BATCH_TOKENS=65536`
-- `VAL_BATCH_SIZE=65536`
+- `NUM_LAYERS=11`
+- `MODEL_DIM=512`
+- `MLP_MULT=3`
+- `TRAIN_SEQ_LEN=2048`
+- `GRAD_ACCUM_STEPS=4`
+- `TRAIN_BATCH_TOKENS=262144`
+- `VAL_BATCH_SIZE=262144`
 - `MUON_BACKEND_STEPS=5`
+- `MUON_WD=0.02`
+- `EVAL_STRIDE=64`
+- `XSA_LAST_N=4`
+- `ROPE_DIMS=32`
+- `LN_SCALE=1`
+- `LATE_QAT=1`
+- `BIGRAM_DIM=64`
+- `TTT_ENABLED=1`
 - `SKIP_PIP_INSTALL=0`
 
 Additional supported tuning knobs:
 - `TRAIN_BATCH_TOKENS=...`
 - `VAL_BATCH_SIZE=...`
-- `ROUNDTRIP_EVAL_EVERY=...`
+- `GRAD_ACCUM_STEPS=...`
+- `XSA_LAST_N=...`
+- `ROPE_DIMS=...`
+- `LATE_QAT=...`
+- `TTT_ENABLED=...`
 
 ## Secrets
 
