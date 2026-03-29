@@ -114,6 +114,20 @@ def save_current_pod_state(pod_id: str, ssh_info: dict[str, Any] | None = None) 
         )
 
 
+def load_current_pod_state(pod_id: str | None = None) -> dict[str, Any] | None:
+    if not CURRENT_POD_JSON_PATH.exists():
+        return None
+    try:
+        data = json.loads(CURRENT_POD_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if pod_id and data.get("pod_id") != pod_id:
+        return None
+    return data
+
+
 def clear_current_pod_state(pod_id: str | None = None) -> None:
     if pod_id and CURRENT_POD_ID_PATH.exists():
         current = CURRENT_POD_ID_PATH.read_text(encoding="utf-8").strip()
@@ -136,18 +150,54 @@ def pod_get_json(pod_id: str) -> dict[str, Any]:
     return data
 
 
-def pod_list_json() -> list[dict[str, Any]]:
-    data = runpod_json(["pod", "list"])
+def pod_list_json(*, include_all: bool = False, name: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    args = ["pod", "list"]
+    if include_all:
+        args.append("--all")
+    if name:
+        args.extend(["--name", name])
+    if status:
+        args.extend(["--status", status])
+    data = runpod_json(args)
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
 
 
 def ssh_info_json(pod_id: str) -> dict[str, Any]:
-    data = runpod_json(["ssh", "info", pod_id])
-    if not isinstance(data, dict):
-        raise SystemExit(f"Unexpected ssh info JSON for {pod_id}")
-    return data
+    last_error: Exception | None = None
+
+    cached = load_current_pod_state(pod_id)
+    cached_ssh = cached.get("ssh_info") if cached else None
+    if isinstance(cached_ssh, dict) and all(
+        cached_ssh.get(field) for field in ("ip", "port", "ssh_command")
+    ) and isinstance((cached_ssh.get("ssh_key") or {}), dict) and (cached_ssh.get("ssh_key") or {}).get("path"):
+        return cached_ssh
+
+    for _ in range(3):
+        try:
+            data = runpod_json(["ssh", "info", pod_id])
+            if not isinstance(data, dict):
+                raise SystemExit(f"Unexpected ssh info JSON for {pod_id}")
+            if all(data.get(field) for field in ("ip", "port", "ssh_command")):
+                save_current_pod_state(pod_id, data)
+            return data
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+
+    try:
+        pod = pod_get_json(pod_id)
+        ssh = pod.get("ssh")
+        if isinstance(ssh, dict) and all(ssh.get(field) for field in ("ip", "port", "ssh_command")):
+            save_current_pod_state(pod_id, ssh)
+            return ssh
+    except Exception as exc:
+        last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise SystemExit(f"Unexpected ssh info JSON for {pod_id}")
 
 
 def ssh_parts(pod_id: str) -> tuple[str, str, str, str]:
@@ -192,11 +242,34 @@ def wait_for_ssh_ready(pod_id: str, attempts: int = 60, interval_seconds: int = 
     raise TimeoutError(f"Timed out waiting for SSH readiness on pod {pod_id}")
 
 
-def find_reusable_pod_id(name: str) -> str | None:
-    for pod in pod_list_json():
-        if pod.get("name") == name and pod.get("desiredStatus") == "RUNNING":
-            return str(pod["id"])
-    return None
+def start_pod(pod_id: str) -> bool:
+    eprint(f"==> Starting stopped pod {pod_id}")
+    try:
+        run(["runpodctl", "pod", "start", pod_id])
+        return True
+    except subprocess.CalledProcessError as exc:
+        message = format_completed_error(exc)
+        if "not enough free gpus on the host machine" in message.lower():
+            eprint("==> Reuse failed because the old host no longer has free GPUs; creating a fresh pod instead")
+            return False
+        raise SystemExit(message)
+
+
+def find_reusable_pod(name: str) -> dict[str, Any] | None:
+    current_pod_id = CURRENT_POD_ID_PATH.read_text(encoding="utf-8").strip() if CURRENT_POD_ID_PATH.exists() else None
+    candidates = pod_list_json(include_all=True, name=name)
+    if not candidates:
+        return None
+
+    def rank(pod: dict[str, Any]) -> tuple[int, int]:
+        pod_id = str(pod.get("id", ""))
+        status = str(pod.get("desiredStatus", ""))
+        running_rank = 0 if status == "RUNNING" else 1
+        current_rank = 0 if current_pod_id and pod_id == current_pod_id else 1
+        return (running_rank, current_rank)
+
+    candidates.sort(key=rank)
+    return candidates[0]
 
 
 def create_pod(config: dict[str, str]) -> str:
@@ -270,12 +343,19 @@ def ensure_pod_ready_from_config(config: dict[str, str]) -> str:
     wait_for_ssh = config.get("WAIT_FOR_SSH", "1") == "1"
     attempts = int(config.get("WAIT_FOR_SSH_ATTEMPTS", "60"))
     interval = int(config.get("WAIT_FOR_SSH_INTERVAL_SECONDS", "10"))
-    reusable = find_reusable_pod_id(pod_name)
+    reusable = find_reusable_pod(pod_name)
     if reusable:
-        if wait_for_ssh:
-            wait_for_ssh_ready(reusable, attempts, interval)
-        save_current_pod_state(reusable)
-        return reusable
+        reusable_id = str(reusable["id"])
+        if str(reusable.get("desiredStatus")) == "EXITED":
+            if not start_pod(reusable_id):
+                reusable = None
+            else:
+                reusable["desiredStatus"] = "RUNNING"
+        if reusable is not None:
+            if wait_for_ssh:
+                wait_for_ssh_ready(reusable_id, attempts, interval)
+            save_current_pod_state(reusable_id)
+            return reusable_id
     pod_id = create_pod(config)
     if wait_for_ssh:
         wait_for_ssh_ready(pod_id, attempts, interval)

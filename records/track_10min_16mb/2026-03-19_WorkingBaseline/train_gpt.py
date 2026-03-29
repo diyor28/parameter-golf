@@ -6,6 +6,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import glob
 import io
@@ -71,6 +72,13 @@ class Hyperparameters:
     roundtrip_eval_every = int(os.environ.get("ROUNDTRIP_EVAL_EVERY", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
     gpu_metrics_enable = bool(int(os.environ.get("GPU_METRICS_ENABLE", "1")))
+    profiler_enable = bool(int(os.environ.get("TORCH_PROFILER_ENABLE", "0")))
+    profiler_wait_steps = int(os.environ.get("TORCH_PROFILER_WAIT_STEPS", 10))
+    profiler_warmup_steps = int(os.environ.get("TORCH_PROFILER_WARMUP_STEPS", 2))
+    profiler_active_steps = int(os.environ.get("TORCH_PROFILER_ACTIVE_STEPS", 4))
+    profiler_record_shapes = bool(int(os.environ.get("TORCH_PROFILER_RECORD_SHAPES", "1")))
+    profiler_profile_memory = bool(int(os.environ.get("TORCH_PROFILER_PROFILE_MEMORY", "1")))
+    profiler_with_stack = bool(int(os.environ.get("TORCH_PROFILER_WITH_STACK", "0")))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
@@ -130,7 +138,7 @@ class Hyperparameters:
     late_qat = bool(int(os.environ.get("LATE_QAT", "0")))  # enable STE QAT late in training
     qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.1))  # lr_scale threshold for late QAT
 
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.004))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
@@ -477,6 +485,32 @@ def query_nvidia_smi_metrics(local_rank: int) -> dict[str, float]:
         "gpu/memory_total_mib": mem_total,
         "gpu/memory_used_pct": mem_used_pct,
     }
+
+
+def _event_device_self_ms(event: object) -> float:
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        value = getattr(event, attr, None)
+        if value is not None:
+            return float(value) / 1000.0
+    return 0.0
+
+
+def _event_device_total_ms(event: object) -> float:
+    for attr in ("device_time_total", "cuda_time_total"):
+        value = getattr(event, attr, None)
+        if value is not None:
+            return float(value) / 1000.0
+    return 0.0
+
+
+def _event_cpu_self_ms(event: object) -> float:
+    return float(getattr(event, "self_cpu_time_total", 0.0)) / 1000.0
+
+
+def _record_scope(enabled: bool, name: str):
+    if not enabled:
+        return contextlib.nullcontext()
+    return torch.profiler.record_function(name)
 
 
 # -----------------------------
@@ -1095,6 +1129,10 @@ def main() -> None:
         "ttt_enabled": args.ttt_enabled,
         "muon_backend_steps": args.muon_backend_steps,
         "muon_wd": args.muon_wd,
+        "torch_profiler_enable": args.profiler_enable,
+        "torch_profiler_wait_steps": args.profiler_wait_steps,
+        "torch_profiler_warmup_steps": args.profiler_warmup_steps,
+        "torch_profiler_active_steps": args.profiler_active_steps,
         "compressor": _COMPRESSOR,
     }
 
@@ -1133,6 +1171,96 @@ def main() -> None:
             tags=list(args.wandb_tags),
             notes=args.wandb_notes,
             config=summary_data,
+        )
+        summary_data["wandb_run_id"] = wandb_run.id
+
+    profiler = None
+    profiler_dir = None
+    profiler_state = {"trace_index": 0, "step": 0}
+
+    if master_process and args.profiler_enable:
+        profiler_dir = os.path.join(artifacts_dir, "profiler")
+        os.makedirs(profiler_dir, exist_ok=True)
+
+        def on_trace_ready(prof: torch.profiler.profile) -> None:
+            profiler_state["trace_index"] += 1
+            trace_index = profiler_state["trace_index"]
+            trace_path = os.path.join(profiler_dir, f"trace_{trace_index:02d}.pt.trace.json")
+            summary_json_path = os.path.join(profiler_dir, f"trace_{trace_index:02d}.summary.json")
+            summary_txt_path = os.path.join(profiler_dir, f"trace_{trace_index:02d}.table.txt")
+            prof.export_chrome_trace(trace_path)
+            key_averages = prof.key_averages()
+            sorted_events = sorted(key_averages, key=_event_device_self_ms, reverse=True)
+            top_ops = []
+            scope_totals = {}
+            for event in sorted_events:
+                key = getattr(event, "key", "")
+                item = {
+                    "name": key,
+                    "count": int(getattr(event, "count", 0)),
+                    "device_self_ms": _event_device_self_ms(event),
+                    "device_total_ms": _event_device_total_ms(event),
+                    "cpu_self_ms": _event_cpu_self_ms(event),
+                }
+                top_ops.append(item)
+                if isinstance(key, str) and key.startswith("train/"):
+                    scope_totals[key] = item
+            summary_payload = {
+                "trace_index": trace_index,
+                "step": profiler_state["step"],
+                "top_ops_by_device_self_ms": top_ops[:30],
+                "train_scopes": scope_totals,
+            }
+            with open(summary_json_path, "w", encoding="utf-8") as f:
+                json.dump(summary_payload, f, indent=2, sort_keys=True)
+            with open(summary_txt_path, "w", encoding="utf-8") as f:
+                f.write(key_averages.table(sort_by="self_cuda_time_total", row_limit=30))
+            log0(f"profiler:trace_ready step:{profiler_state['step']} trace:{trace_path}")
+            emit_event(
+                "profiler_trace",
+                step=profiler_state["step"],
+                trace_path=trace_path,
+                summary_path=summary_json_path,
+            )
+            summary_data["last_profiler_trace"] = {
+                "step": profiler_state["step"],
+                "trace_path": trace_path,
+                "summary_path": summary_json_path,
+            }
+            if wandb_run is not None:
+                wandb_run.save(trace_path, base_path=artifacts_dir)
+                wandb_run.save(summary_json_path, base_path=artifacts_dir)
+                wandb_run.save(summary_txt_path, base_path=artifacts_dir)
+                log_payload = {
+                    "profiler/trace_step": profiler_state["step"],
+                }
+                for scope_name in ("train/batch_fetch", "train/forward", "train/backward", "train/optimizer"):
+                    if scope_name in scope_totals:
+                        metric_name = scope_name.replace("/", "_")
+                        log_payload[f"profiler/{metric_name}_device_self_ms"] = scope_totals[scope_name]["device_self_ms"]
+                        log_payload[f"profiler/{metric_name}_cpu_self_ms"] = scope_totals[scope_name]["cpu_self_ms"]
+                wandb_run.log(log_payload, step=profiler_state["step"])
+                wandb_run.summary["profiler_last_trace_path"] = trace_path
+                wandb_run.summary["profiler_last_summary_path"] = summary_json_path
+            write_summary()
+
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                wait=args.profiler_wait_steps,
+                warmup=args.profiler_warmup_steps,
+                active=args.profiler_active_steps,
+                repeat=1,
+            ),
+            on_trace_ready=on_trace_ready,
+            record_shapes=args.profiler_record_shapes,
+            profile_memory=args.profiler_profile_memory,
+            with_stack=args.profiler_with_stack,
+        )
+        profiler.start()
+        log0(
+            "profiler:enabled "
+            f"wait={args.profiler_wait_steps} warmup={args.profiler_warmup_steps} active={args.profiler_active_steps}"
         )
 
     log0(code, console=False)
@@ -1404,10 +1532,11 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args, model, rank, world_size, device, grad_accum_steps,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            )
+            with _record_scope(args.profiler_enable and master_process, "train/validation"):
+                val_loss, val_bpb = eval_val(
+                    args, model, rank, world_size, device, grad_accum_steps,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1417,7 +1546,7 @@ def main() -> None:
                 "tokens_seen": step * args.train_batch_tokens,
                 "val_loss": float(val_loss),
                 "val_bpb": float(val_bpb),
-                "training_time_ms": float(training_time_ms),
+                "training_time_s": float(training_time_ms / 1000.0),
             }
             emit_event(
                 "validation",
@@ -1425,7 +1554,7 @@ def main() -> None:
                 tokens_seen=step * args.train_batch_tokens,
                 val_loss=val_loss,
                 val_bpb=val_bpb,
-                training_time_ms=training_time_ms,
+                training_time_s=float(training_time_ms / 1000.0),
             )
             if wandb_run is not None:
                 wandb_run.log(
@@ -1433,7 +1562,7 @@ def main() -> None:
                         "tokens_seen": step * args.train_batch_tokens,
                         "val/loss": val_loss,
                         "val/bpb": val_bpb,
-                        "time/training_ms": training_time_ms,
+                        "time/training_s": float(training_time_ms / 1000.0),
                     },
                     step=step,
                 )
@@ -1449,7 +1578,7 @@ def main() -> None:
                 )
                 summary_data["stop_reason"] = "wallclock_cap"
                 summary_data["stopped_at_step"] = step
-                emit_event("stop", reason="wallclock_cap", step=step, training_time_ms=training_time_ms)
+                emit_event("stop", reason="wallclock_cap", step=step, training_time_s=float(training_time_ms / 1000.0))
                 if wandb_run is not None:
                     wandb_run.summary["stop_reason"] = "wallclock_cap"
                     wandb_run.summary["stopped_at_step"] = step
@@ -1468,11 +1597,14 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+            with _record_scope(args.profiler_enable and master_process, "train/batch_fetch"):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with _record_scope(args.profiler_enable and master_process, "train/forward"):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
             train_loss += loss.detach()
-            (loss * grad_scale).backward()
+            with _record_scope(args.profiler_enable and master_process, "train/backward"):
+                (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1485,9 +1617,11 @@ def main() -> None:
                 group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
+            with _record_scope(args.profiler_enable and master_process, "train/grad_clip"):
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        with _record_scope(args.profiler_enable and master_process, "train/optimizer"):
+            for opt in optimizers:
+                opt.step()
         zero_grad_all()
 
         step += 1
@@ -1527,7 +1661,7 @@ def main() -> None:
                 "step": step,
                 "tokens_seen": step * args.train_batch_tokens,
                 "train_loss": float(train_loss.item()),
-                "training_time_ms": float(approx_training_time_ms),
+                "training_time_s": float(approx_training_time_ms / 1000.0),
                 "lr_scale": float(scale),
                 "muon_momentum": float(muon_momentum),
                 **cuda_metrics,
@@ -1537,7 +1671,7 @@ def main() -> None:
                 step=step,
                 tokens_seen=step * args.train_batch_tokens,
                 train_loss=float(train_loss.item()),
-                training_time_ms=float(approx_training_time_ms),
+                training_time_s=float(approx_training_time_ms / 1000.0),
                 lr_scale=float(scale),
                 muon_momentum=float(muon_momentum),
                 **cuda_metrics,
@@ -1546,7 +1680,7 @@ def main() -> None:
                 payload = {
                     "tokens_seen": step * args.train_batch_tokens,
                     "train/loss": float(train_loss.item()),
-                    "time/training_ms": float(approx_training_time_ms),
+                    "time/training_s": float(approx_training_time_ms / 1000.0),
                     "sched/lr_scale": float(scale),
                     "optim/muon_momentum": float(muon_momentum),
                     "cuda/memory_allocated_mib": float(torch.cuda.memory_allocated() / (1024 ** 2)),
@@ -1565,20 +1699,25 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+        if profiler is not None:
+            profiler_state["step"] = step
+            profiler.step()
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if profiler is not None:
+        profiler.stop()
     summary_data["peak_memory_allocated_mib"] = int(torch.cuda.max_memory_allocated() // 1024 // 1024)
     summary_data["peak_memory_reserved_mib"] = int(torch.cuda.max_memory_reserved() // 1024 // 1024)
-    summary_data["training_time_ms"] = float(training_time_ms)
+    summary_data["training_time_s"] = float(training_time_ms / 1000.0)
     summary_data["completed_steps"] = int(step)
     summary_data["tokens_seen"] = int(step * args.train_batch_tokens)
     if wandb_run is not None:
         wandb_run.summary["peak_memory_allocated_mib"] = summary_data["peak_memory_allocated_mib"]
         wandb_run.summary["peak_memory_reserved_mib"] = summary_data["peak_memory_reserved_mib"]
-        wandb_run.summary["training_time_ms"] = training_time_ms
+        wandb_run.summary["training_time_s"] = float(training_time_ms / 1000.0)
         wandb_run.summary["completed_steps"] = step
         wandb_run.summary["tokens_seen"] = step * args.train_batch_tokens
     write_summary()

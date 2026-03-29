@@ -9,7 +9,8 @@ just run
 
 `just` now calls [launcher.py](/Users/diyorkhaydarov/Projects/toys/parameter-golf/records/track_10min_16mb/2026-03-19_WorkingBaseline/runpod/launcher.py), which does all of the following under the hood:
 - reuses a matching running pod if one already exists
-- otherwise creates a fresh pod
+- otherwise tries to restart a matching stopped pod
+- if the stopped pod cannot be resumed on its old host, creates a fresh pod
 - waits for real SSH readiness
 - syncs only the required local snapshot via `rsync`
 - runs remote bootstrap only if the pod is not already bootstrapped
@@ -97,7 +98,8 @@ just summarize
 - `rsync` runs with `--no-owner --no-group` to avoid the permission noise we hit on Runpod volumes.
 - The local repo is the source of truth. We do not manage a mutable remote git checkout.
 - We sync only the paths the run actually needs: `data/` and the working record folder.
-- We only reuse already-running pods by default. Stopped pods are not resumed automatically.
+- We prefer reusing a matching running pod first, then a matching stopped pod.
+- If Runpod refuses to restart the stopped pod because the original host no longer has free GPUs, we fall back to creating a fresh secure pod.
 - The pod configs still default to the official Runpod PyTorch 2.8.0 template `runpod-torch-v280`.
 - The experiment pod uses `2x NVIDIA GeForce RTX 5090` on `SECURE` cloud only.
 - New launches fail fast if secure capacity is unavailable.
@@ -111,7 +113,7 @@ just summarize
 - `MODEL_DIM=512`
 - `MLP_MULT=3`
 - `TRAIN_SEQ_LEN=2048`
-- `GRAD_ACCUM_STEPS=4`
+- `GRAD_ACCUM_STEPS=1`
 - `TRAIN_BATCH_TOKENS=262144`
 - `VAL_BATCH_SIZE=262144`
 - `MUON_BACKEND_STEPS=5`
@@ -122,7 +124,8 @@ just summarize
 - `LN_SCALE=1`
 - `LATE_QAT=1`
 - `BIGRAM_DIM=64`
-- `TTT_ENABLED=1`
+- `TTT_ENABLED=0`
+- `TORCH_PROFILER_ENABLE=1`
 - `SKIP_PIP_INSTALL=0`
 
 Additional supported tuning knobs:
